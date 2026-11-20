@@ -51,8 +51,8 @@ jobs:
                   applicationId = "com.example.btremote"
                   minSdk = 28
                   targetSdk = 34
-                  versionCode = 5
-                  versionName = "1.4"
+                  versionCode = 6
+                  versionName = "1.5"
               }
 
               compileOptions {
@@ -158,8 +158,6 @@ jobs:
                       0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
                       0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
                       0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
-                      0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02,
-                      0x95, 0x01, 0x75, 0x03, 0x91, 0x01,
                       0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
                       0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
                       0xC0
@@ -337,8 +335,17 @@ jobs:
               }
 
               private var isRegistered = false
+              private var regRetried = false
               private val regWatch = Runnable {
-                  if (!isRegistered) setStatus("[1단계 실패] 등록 응답 없음: 폰 블루투스를 껐다 켜고 앱을 다시 실행하세요")
+                  if (isRegistered) return@Runnable
+                  if (!regRetried) {
+                      regRetried = true
+                      setStatus("[1단계] 응답이 없어 다시 등록하는 중")
+                      try { hid?.unregisterApp() } catch (_: Exception) {}
+                      handler.postDelayed({ register() }, 1500)
+                  } else {
+                      setStatus("[1단계 실패] 등록 응답 없음")
+                  }
               }
               private var pendingConnect: BluetoothDevice? = null
               private var retried = false
@@ -346,7 +353,7 @@ jobs:
               private fun register() {
                   val h = hid ?: return
                   val sdp = BluetoothHidDeviceAppSdpSettings(
-                      "BT Remote", "Keyboard", "BtRemote",
+                      "방향키 리모컨", "방향키 리모컨", "BtRemote",
                       BluetoothHidDevice.SUBCLASS1_KEYBOARD, DESCRIPTOR
                   )
                   val ok = h.registerApp(sdp, null, null, mainExecutor, hidCallback)
@@ -402,9 +409,6 @@ jobs:
                       }
                   }
 
-                  override fun onSetReport(device: BluetoothDevice, type: Byte, id: Byte, data: ByteArray) {
-                      hid?.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS)
-                  }
               }
 
               private fun savedHost(): BluetoothDevice? {
