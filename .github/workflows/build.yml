@@ -1,0 +1,466 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Write project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "BtRemote"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.btremote"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.btremote"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="방향키 리모컨"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/btremote
+          cat > app/src/main/java/com/example/btremote/MainActivity.kt <<'EOF_FILE'
+          package com.example.btremote
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.bluetooth.BluetoothAdapter
+          import android.bluetooth.BluetoothDevice
+          import android.bluetooth.BluetoothHidDevice
+          import android.bluetooth.BluetoothHidDeviceAppSdpSettings
+          import android.bluetooth.BluetoothManager
+          import android.bluetooth.BluetoothProfile
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.res.Configuration
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.Space
+          import android.widget.TextView
+
+          @SuppressLint("MissingPermission", "ClickableViewAccessibility", "SetTextI18n")
+          class MainActivity : Activity() {
+
+              companion object {
+                  private const val REQ_PERM = 1
+                  private const val REQ_ENABLE = 2
+                  private const val REPORT_ID = 1
+
+                  // HID 키보드 사용 코드
+                  private const val KEY_RIGHT = 0x4F
+                  private const val KEY_LEFT = 0x50
+                  private const val KEY_DOWN = 0x51
+                  private const val KEY_UP = 0x52
+                  private const val KEY_ENTER = 0x28
+                  private const val KEY_ESC = 0x29
+                  private const val KEY_SPACE = 0x2C
+
+                  // 표준 키보드 리포트 디스크립터 (Report ID 1, 수정키 1바이트 + 예약 1바이트 + 키 6개)
+                  private val DESCRIPTOR = intArrayOf(
+                      0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, REPORT_ID,
+                      0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
+                      0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+                      0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+                      0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
+                      0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
+                      0xC0
+                  ).map { it.toByte() }.toByteArray()
+              }
+
+              private var adapter: BluetoothAdapter? = null
+              private var hid: BluetoothHidDevice? = null
+              private var host: BluetoothDevice? = null
+              private val pressed = LinkedHashSet<Int>()
+              private val prefs by lazy { getSharedPreferences("bt", Context.MODE_PRIVATE) }
+
+              private lateinit var status: TextView
+              private var bg = 0
+              private var keyColor = 0
+              private var keyOn = 0
+              private var fg = 0
+              private var muted = 0
+
+              // ---------- 생명주기 ----------
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  setupColors()
+                  setContentView(buildUi())
+
+                  adapter = getSystemService(BluetoothManager::class.java)?.adapter
+                  if (adapter == null) {
+                      setStatus("이 폰은 블루투스를 지원하지 않아요")
+                      return
+                  }
+                  checkPermissions()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  releaseAll()
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  try {
+                      hid?.unregisterApp()
+                      hid?.let { adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, it) }
+                  } catch (_: Exception) {
+                  }
+              }
+
+              // ---------- 권한 / 블루투스 켜기 ----------
+
+              private fun checkPermissions() {
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      val needed = arrayOf(
+                          Manifest.permission.BLUETOOTH_CONNECT,
+                          Manifest.permission.BLUETOOTH_ADVERTISE
+                      ).filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                      if (needed.isNotEmpty()) {
+                          requestPermissions(needed.toTypedArray(), REQ_PERM)
+                          return
+                      }
+                  }
+                  ensureEnabled()
+              }
+
+              override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
+                  super.onRequestPermissionsResult(code, perms, results)
+                  if (code != REQ_PERM) return
+                  if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) {
+                      ensureEnabled()
+                  } else {
+                      setStatus("블루투스 권한을 허용해야 쓸 수 있어요")
+                  }
+              }
+
+              private fun ensureEnabled() {
+                  if (adapter?.isEnabled == true) {
+                      startHid()
+                  } else {
+                      startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), REQ_ENABLE)
+                  }
+              }
+
+              @Deprecated("Activity API")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == REQ_ENABLE) {
+                      if (adapter?.isEnabled == true) startHid() else setStatus("블루투스를 켜야 쓸 수 있어요")
+                  }
+              }
+
+              // ---------- HID 키보드 등록 ----------
+
+              private fun startHid() {
+                  setStatus("준비 중")
+                  adapter?.getProfileProxy(this, profileListener, BluetoothProfile.HID_DEVICE)
+              }
+
+              private val profileListener = object : BluetoothProfile.ServiceListener {
+                  override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                      if (profile != BluetoothProfile.HID_DEVICE) return
+                      val h = proxy as BluetoothHidDevice
+                      hid = h
+                      val sdp = BluetoothHidDeviceAppSdpSettings(
+                          "방향키 리모컨", "방향키 리모컨", "BtRemote",
+                          BluetoothHidDevice.SUBCLASS1_KEYBOARD, DESCRIPTOR
+                      )
+                      val ok = h.registerApp(sdp, null, null, mainExecutor, hidCallback)
+                      if (!ok) setStatus("키보드 등록 실패: 다른 리모컨 앱을 끄고 다시 실행하세요")
+                  }
+
+                  override fun onServiceDisconnected(profile: Int) {
+                      hid = null
+                      host = null
+                      setStatus("블루투스 서비스가 끊겼어요. 앱을 다시 실행하세요")
+                  }
+              }
+
+              private val hidCallback = object : BluetoothHidDevice.Callback() {
+                  override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+                      if (!registered) {
+                          setStatus("키보드 등록이 해제됐어요. 앱을 다시 실행하세요")
+                          return
+                      }
+                      val target = pluggedDevice ?: savedHost()
+                      if (target != null) {
+                          setStatus("${nameOf(target)}에 연결 중")
+                          hid?.connect(target)
+                      } else {
+                          setStatus("처음이면 ‘새 PC와 페어링’을 누르세요")
+                      }
+                  }
+
+                  override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
+                      when (state) {
+                          BluetoothProfile.STATE_CONNECTED -> {
+                              host = device
+                              prefs.edit().putString("host", device.address).apply()
+                              setStatus("${nameOf(device)}에 연결됨")
+                          }
+                          BluetoothProfile.STATE_CONNECTING -> setStatus("연결 중")
+                          BluetoothProfile.STATE_DISCONNECTED -> {
+                              if (host?.address == device.address) host = null
+                              pressed.clear()
+                              setStatus("연결 끊김: ‘다시 연결’을 누르세요")
+                          }
+                      }
+                  }
+
+                  override fun onGetReport(device: BluetoothDevice, type: Byte, id: Byte, bufferSize: Int) {
+                      hid?.replyReport(device, type, id, buildReport())
+                  }
+              }
+
+              private fun savedHost(): BluetoothDevice? {
+                  val addr = prefs.getString("host", null) ?: return null
+                  return adapter?.bondedDevices?.firstOrNull { it.address == addr }
+              }
+
+              private fun nameOf(d: BluetoothDevice): String = d.name ?: "PC"
+
+              private fun reconnect() {
+                  val h = hid ?: run { setStatus("아직 준비 중이에요. 잠시 후 다시 눌러주세요"); return }
+                  val target = savedHost() ?: run { setStatus("저장된 PC가 없어요. 먼저 ‘새 PC와 페어링’을 누르세요"); return }
+                  setStatus("${nameOf(target)}에 연결 중")
+                  h.connect(target)
+              }
+
+              private fun makeDiscoverable() {
+                  startActivity(
+                      Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                          .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120)
+                  )
+                  setStatus("PC의 블루투스 설정 → 장치 추가에서 이 폰을 선택하세요")
+              }
+
+              // ---------- 키 입력 ----------
+
+              private fun buildReport(): ByteArray {
+                  val r = ByteArray(8)
+                  pressed.take(6).forEachIndexed { i, code -> r[2 + i] = code.toByte() }
+                  return r
+              }
+
+              private fun sendReport() {
+                  val d = host ?: return
+                  hid?.sendReport(d, REPORT_ID, buildReport())
+              }
+
+              private fun keyDown(code: Int) {
+                  if (pressed.add(code)) sendReport()
+              }
+
+              private fun keyUp(code: Int) {
+                  if (pressed.remove(code)) sendReport()
+              }
+
+              private fun releaseAll() {
+                  if (pressed.isNotEmpty()) {
+                      pressed.clear()
+                      sendReport()
+                  }
+              }
+
+              // ---------- 화면 ----------
+
+              private fun setStatus(text: String) = runOnUiThread { status.text = text }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun setupColors() {
+                  val night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                          Configuration.UI_MODE_NIGHT_YES
+                  if (night) {
+                      bg = Color.parseColor("#161C22"); keyColor = Color.parseColor("#26303A")
+                      keyOn = Color.parseColor("#4C8DF6"); fg = Color.parseColor("#E6ECF1"); muted = Color.parseColor("#94A3B0")
+                  } else {
+                      bg = Color.parseColor("#E6EBEF"); keyColor = Color.parseColor("#FFFFFF")
+                      keyOn = Color.parseColor("#2F6FDB"); fg = Color.parseColor("#24323F"); muted = Color.parseColor("#5D6B78")
+                  }
+              }
+
+              private fun rounded(color: Int) = GradientDrawable().apply {
+                  cornerRadius = dp(18).toFloat()
+                  setColor(color)
+              }
+
+              private fun keyButton(label: String, code: Int, size: Float): Button = Button(this).apply {
+                  text = label
+                  textSize = size
+                  isAllCaps = false
+                  setTextColor(fg)
+                  stateListAnimator = null
+                  background = rounded(keyColor)
+                  setOnTouchListener { v, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                              (v.background as GradientDrawable).setColor(keyOn)
+                              (v as Button).setTextColor(Color.WHITE)
+                              keyDown(code)
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              (v.background as GradientDrawable).setColor(keyColor)
+                              (v as Button).setTextColor(fg)
+                              keyUp(code)
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun smallButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
+                  text = label
+                  textSize = 14f
+                  isAllCaps = false
+                  setTextColor(fg)
+                  stateListAnimator = null
+                  background = rounded(keyColor).apply { cornerRadius = dp(12).toFloat() }
+                  setOnClickListener { onClick() }
+              }
+
+              private fun weighted(height: Int) =
+                  LinearLayout.LayoutParams(0, height, 1f).apply { setMargins(dp(5), 0, dp(5), 0) }
+
+              private fun buildUi(): View {
+                  val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+                  val match = ViewGroup.LayoutParams.MATCH_PARENT
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(bg)
+                      setPadding(dp(16), dp(24), dp(16), dp(24))
+                  }
+
+                  status = TextView(this).apply {
+                      textSize = 15f
+                      setTextColor(muted)
+                      gravity = Gravity.CENTER
+                      text = "준비 중"
+                  }
+                  root.addView(status, LinearLayout.LayoutParams(match, wrap).apply { bottomMargin = dp(14) })
+
+                  val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  actions.addView(smallButton("새 PC와 페어링") { makeDiscoverable() }, weighted(dp(46)))
+                  actions.addView(smallButton("다시 연결") { reconnect() }, weighted(dp(46)))
+                  root.addView(actions, LinearLayout.LayoutParams(dp(330), wrap).apply { bottomMargin = dp(28) })
+
+                  val grid = listOf(
+                      listOf(null, "▲" to KEY_UP, null),
+                      listOf("◀" to KEY_LEFT, null, "▶" to KEY_RIGHT),
+                      listOf(null, "▼" to KEY_DOWN, null)
+                  )
+                  for (row in grid) {
+                      val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                      for (cell in row) {
+                          val v: View = if (cell == null) Space(this) else keyButton(cell.first, cell.second, 30f)
+                          line.addView(v, LinearLayout.LayoutParams(dp(100), dp(100)).apply {
+                              setMargins(dp(5), dp(5), dp(5), dp(5))
+                          })
+                      }
+                      root.addView(line)
+                  }
+
+                  val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  listOf("ESC" to KEY_ESC, "스페이스" to KEY_SPACE, "엔터" to KEY_ENTER).forEach { (label, code) ->
+                      bottom.addView(keyButton(label, code, 18f), weighted(dp(72)))
+                  }
+                  root.addView(bottom, LinearLayout.LayoutParams(dp(330), wrap).apply { topMargin = dp(24) })
+
+                  return root
+              }
+          }
+          EOF_FILE
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bt-remote-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
