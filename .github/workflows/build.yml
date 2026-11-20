@@ -51,8 +51,8 @@ jobs:
                   applicationId = "com.example.btremote"
                   minSdk = 28
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "1.1"
+                  versionCode = 3
+                  versionName = "1.2"
               }
 
               compileOptions {
@@ -71,6 +71,8 @@ jobs:
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
               <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
 
               <application
@@ -104,8 +106,10 @@ jobs:
           import android.bluetooth.BluetoothHidDeviceAppSdpSettings
           import android.bluetooth.BluetoothManager
           import android.bluetooth.BluetoothProfile
+          import android.content.BroadcastReceiver
           import android.content.Context
           import android.content.Intent
+          import android.content.IntentFilter
           import android.content.pm.PackageManager
           import android.content.res.Configuration
           import android.graphics.Color
@@ -162,6 +166,38 @@ jobs:
               private val pressed = LinkedHashSet<Int>()
               private val prefs by lazy { getSharedPreferences("bt", Context.MODE_PRIVATE) }
               private val handler = Handler(Looper.getMainLooper())
+              private val found = LinkedHashMap<String, BluetoothDevice>()
+              private var searching = false
+              private var pendingBond: String? = null
+
+              private val receiver = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      when (i.action) {
+                          BluetoothDevice.ACTION_FOUND -> {
+                              val d = deviceFrom(i) ?: return
+                              if (d.name != null) found[d.address] = d
+                              if (searching) setStatus("PC 찾는 중… ${found.size}개 발견")
+                          }
+                          BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> showFound()
+                          BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                              val d = deviceFrom(i) ?: return
+                              if (d.address != pendingBond) return
+                              when (i.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)) {
+                                  BluetoothDevice.BOND_BONDED -> {
+                                      pendingBond = null
+                                      setStatus("페어링 완료. 연결하는 중")
+                                      handler.postDelayed({ connectTo(d) }, 1500)
+                                  }
+                                  BluetoothDevice.BOND_NONE -> {
+                                      pendingBond = null
+                                      setStatus("페어링 실패: ‘PC 찾기’를 다시 눌러주세요")
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
               private val timeout = Runnable {
                   if (host == null) setStatus("연결이 안 돼요. PC와 폰 양쪽에서 페어링을 지우고 다시 페어링해보세요")
               }
@@ -181,6 +217,14 @@ jobs:
                   setupColors()
                   setContentView(buildUi())
 
+                  val filter = IntentFilter().apply {
+                      addAction(BluetoothDevice.ACTION_FOUND)
+                      addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+                      addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+                  }
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                  else registerReceiver(receiver, filter)
+
                   adapter = getSystemService(BluetoothManager::class.java)?.adapter
                   if (adapter == null) {
                       setStatus("이 폰은 블루투스를 지원하지 않아요")
@@ -197,6 +241,7 @@ jobs:
               override fun onDestroy() {
                   super.onDestroy()
                   handler.removeCallbacksAndMessages(null)
+                  try { unregisterReceiver(receiver) } catch (_: Exception) {}
                   try {
                       hid?.unregisterApp()
                       hid?.let { adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, it) }
@@ -207,15 +252,15 @@ jobs:
               // ---------- 권한 / 블루투스 켜기 ----------
 
               private fun checkPermissions() {
-                  if (Build.VERSION.SDK_INT >= 31) {
-                      val needed = arrayOf(
-                          Manifest.permission.BLUETOOTH_CONNECT,
-                          Manifest.permission.BLUETOOTH_ADVERTISE
-                      ).filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-                      if (needed.isNotEmpty()) {
-                          requestPermissions(needed.toTypedArray(), REQ_PERM)
-                          return
-                      }
+                  val wanted = if (Build.VERSION.SDK_INT >= 31) arrayOf(
+                      Manifest.permission.BLUETOOTH_CONNECT,
+                      Manifest.permission.BLUETOOTH_ADVERTISE,
+                      Manifest.permission.BLUETOOTH_SCAN
+                  ) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                  val needed = wanted.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                  if (needed.isNotEmpty()) {
+                      requestPermissions(needed.toTypedArray(), REQ_PERM)
+                      return
                   }
                   ensureEnabled()
               }
@@ -288,7 +333,7 @@ jobs:
                       if (target != null) {
                           connectTo(target)
                       } else {
-                          setStatus("키보드 준비 완료. 처음이면 ‘새 PC와 페어링’, 이미 페어링했다면 ‘PC 선택’을 누르세요")
+                          setStatus("키보드 준비 완료. ‘PC 찾기’를 눌러 연결하세요")
                       }
                   }
 
@@ -339,6 +384,54 @@ jobs:
                   }
                   handler.removeCallbacks(timeout)
                   handler.postDelayed(timeout, 10_000)
+              }
+
+              private fun deviceFrom(i: Intent): BluetoothDevice? =
+                  if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                  else @Suppress("DEPRECATION") i.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+
+              private fun findPcs() {
+                  val a = adapter ?: return
+                  if (hid == null) {
+                      setStatus("아직 준비 중이에요. 잠시 후 다시 눌러주세요")
+                      return
+                  }
+                  found.clear()
+                  if (a.isDiscovering) a.cancelDiscovery()
+                  searching = a.startDiscovery()
+                  if (searching) setStatus("PC 찾는 중… PC의 블루투스 설정 화면을 열어두세요")
+                  else setStatus("검색 실패: 폰의 위치(GPS)를 켜고 다시 눌러주세요")
+              }
+
+              private fun showFound() {
+                  if (!searching || isFinishing) return
+                  searching = false
+                  val list = found.values.toList()
+                  if (list.isEmpty()) {
+                      setStatus("PC를 못 찾았어요. PC의 블루투스 설정 화면을 열어두고 다시 눌러주세요")
+                      return
+                  }
+                  setStatus("연결할 PC를 고르세요")
+                  AlertDialog.Builder(this)
+                      .setTitle("PC 선택")
+                      .setItems(list.map { nameOf(it) }.toTypedArray()) { _, i -> pairAndConnect(list[i]) }
+                      .setNegativeButton("취소", null)
+                      .show()
+              }
+
+              private fun pairAndConnect(d: BluetoothDevice) {
+                  searching = false
+                  adapter?.cancelDiscovery()
+                  if (d.bondState == BluetoothDevice.BOND_BONDED) {
+                      connectTo(d)
+                      return
+                  }
+                  pendingBond = d.address
+                  setStatus("${nameOf(d)}와 페어링 중. 양쪽에 뜬 숫자를 확인하세요")
+                  if (!d.createBond()) {
+                      pendingBond = null
+                      setStatus("페어링 요청 실패: ‘PC 찾기’를 다시 눌러주세요")
+                  }
               }
 
               private fun pickPc() {
@@ -471,7 +564,7 @@ jobs:
                   root.addView(status, LinearLayout.LayoutParams(match, wrap).apply { bottomMargin = dp(14) })
 
                   val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-                  actions.addView(smallButton("새 PC와 페어링") { makeDiscoverable() }, weighted(dp(46)))
+                  actions.addView(smallButton("PC 찾기") { findPcs() }, weighted(dp(46)))
                   actions.addView(smallButton("PC 선택") { pickPc() }, weighted(dp(46)))
                   root.addView(actions, LinearLayout.LayoutParams(dp(330), wrap).apply { bottomMargin = dp(28) })
 
