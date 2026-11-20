@@ -51,8 +51,8 @@ jobs:
                   applicationId = "com.example.btremote"
                   minSdk = 28
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
               }
 
               compileOptions {
@@ -96,9 +96,11 @@ jobs:
           import android.Manifest
           import android.annotation.SuppressLint
           import android.app.Activity
+          import android.app.AlertDialog
           import android.bluetooth.BluetoothAdapter
           import android.bluetooth.BluetoothDevice
           import android.bluetooth.BluetoothHidDevice
+          import android.bluetooth.BluetoothHidDeviceAppQosSettings
           import android.bluetooth.BluetoothHidDeviceAppSdpSettings
           import android.bluetooth.BluetoothManager
           import android.bluetooth.BluetoothProfile
@@ -110,6 +112,8 @@ jobs:
           import android.graphics.drawable.GradientDrawable
           import android.os.Build
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.view.Gravity
           import android.view.HapticFeedbackConstants
           import android.view.MotionEvent
@@ -144,6 +148,8 @@ jobs:
                       0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
                       0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
                       0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+                      0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02,
+                      0x95, 0x01, 0x75, 0x03, 0x91, 0x01,
                       0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
                       0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
                       0xC0
@@ -155,6 +161,10 @@ jobs:
               private var host: BluetoothDevice? = null
               private val pressed = LinkedHashSet<Int>()
               private val prefs by lazy { getSharedPreferences("bt", Context.MODE_PRIVATE) }
+              private val handler = Handler(Looper.getMainLooper())
+              private val timeout = Runnable {
+                  if (host == null) setStatus("연결이 안 돼요. PC와 폰 양쪽에서 페어링을 지우고 다시 페어링해보세요")
+              }
 
               private lateinit var status: TextView
               private var bg = 0
@@ -186,6 +196,7 @@ jobs:
 
               override fun onDestroy() {
                   super.onDestroy()
+                  handler.removeCallbacksAndMessages(null)
                   try {
                       hid?.unregisterApp()
                       hid?.let { adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, it) }
@@ -248,11 +259,15 @@ jobs:
                       val h = proxy as BluetoothHidDevice
                       hid = h
                       val sdp = BluetoothHidDeviceAppSdpSettings(
-                          "방향키 리모컨", "방향키 리모컨", "BtRemote",
+                          "BT Remote", "Keyboard", "BtRemote",
                           BluetoothHidDevice.SUBCLASS1_KEYBOARD, DESCRIPTOR
                       )
-                      val ok = h.registerApp(sdp, null, null, mainExecutor, hidCallback)
-                      if (!ok) setStatus("키보드 등록 실패: 다른 리모컨 앱을 끄고 다시 실행하세요")
+                      val qos = BluetoothHidDeviceAppQosSettings(
+                          BluetoothHidDeviceAppQosSettings.SERVICE_BEST_EFFORT,
+                          800, 9, 0, 11250, BluetoothHidDeviceAppQosSettings.MAX
+                      )
+                      val ok = h.registerApp(sdp, null, qos, mainExecutor, hidCallback)
+                      if (!ok) setStatus("키보드 등록 실패: 다른 블루투스 키보드 앱을 강제 중지하고 다시 실행하세요")
                   }
 
                   override fun onServiceDisconnected(profile: Int) {
@@ -265,21 +280,22 @@ jobs:
               private val hidCallback = object : BluetoothHidDevice.Callback() {
                   override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
                       if (!registered) {
-                          setStatus("키보드 등록이 해제됐어요. 앱을 다시 실행하세요")
+                          setStatus("키보드 등록이 해제됐어요. 다른 블루투스 키보드 앱을 강제 중지하고 이 앱을 다시 실행하세요")
                           return
                       }
-                      val target = pluggedDevice ?: savedHost()
+                      val bonded = adapter?.bondedDevices.orEmpty()
+                      val target = savedHost() ?: pluggedDevice?.takeIf { d -> bonded.any { it.address == d.address } }
                       if (target != null) {
-                          setStatus("${nameOf(target)}에 연결 중")
-                          hid?.connect(target)
+                          connectTo(target)
                       } else {
-                          setStatus("처음이면 ‘새 PC와 페어링’을 누르세요")
+                          setStatus("키보드 준비 완료. 처음이면 ‘새 PC와 페어링’, 이미 페어링했다면 ‘PC 선택’을 누르세요")
                       }
                   }
 
                   override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
                       when (state) {
                           BluetoothProfile.STATE_CONNECTED -> {
+                              handler.removeCallbacks(timeout)
                               host = device
                               prefs.edit().putString("host", device.address).apply()
                               setStatus("${nameOf(device)}에 연결됨")
@@ -288,13 +304,21 @@ jobs:
                           BluetoothProfile.STATE_DISCONNECTED -> {
                               if (host?.address == device.address) host = null
                               pressed.clear()
-                              setStatus("연결 끊김: ‘다시 연결’을 누르세요")
+                              setStatus("연결 끊김: ‘PC 선택’을 눌러 다시 연결하세요")
                           }
                       }
                   }
 
                   override fun onGetReport(device: BluetoothDevice, type: Byte, id: Byte, bufferSize: Int) {
-                      hid?.replyReport(device, type, id, buildReport())
+                      if (type == BluetoothHidDevice.REPORT_TYPE_INPUT) {
+                          hid?.replyReport(device, type, id, buildReport())
+                      } else {
+                          hid?.reportError(device, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ)
+                      }
+                  }
+
+                  override fun onSetReport(device: BluetoothDevice, type: Byte, id: Byte, data: ByteArray) {
+                      hid?.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS)
                   }
               }
 
@@ -305,11 +329,29 @@ jobs:
 
               private fun nameOf(d: BluetoothDevice): String = d.name ?: "PC"
 
-              private fun reconnect() {
+              private fun connectTo(d: BluetoothDevice) {
                   val h = hid ?: run { setStatus("아직 준비 중이에요. 잠시 후 다시 눌러주세요"); return }
-                  val target = savedHost() ?: run { setStatus("저장된 PC가 없어요. 먼저 ‘새 PC와 페어링’을 누르세요"); return }
-                  setStatus("${nameOf(target)}에 연결 중")
-                  h.connect(target)
+                  prefs.edit().putString("host", d.address).apply()
+                  setStatus("${nameOf(d)}에 연결 중")
+                  if (!h.connect(d)) {
+                      setStatus("연결 요청 실패: 폰 블루투스를 껐다 켜고 앱을 다시 실행하세요")
+                      return
+                  }
+                  handler.removeCallbacks(timeout)
+                  handler.postDelayed(timeout, 10_000)
+              }
+
+              private fun pickPc() {
+                  val list = adapter?.bondedDevices?.toList().orEmpty()
+                  if (list.isEmpty()) {
+                      setStatus("페어링된 기기가 없어요. 먼저 ‘새 PC와 페어링’을 누르세요")
+                      return
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("연결할 PC 선택")
+                      .setItems(list.map { nameOf(it) }.toTypedArray()) { _, i -> connectTo(list[i]) }
+                      .setNegativeButton("취소", null)
+                      .show()
               }
 
               private fun makeDiscoverable() {
@@ -430,7 +472,7 @@ jobs:
 
                   val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
                   actions.addView(smallButton("새 PC와 페어링") { makeDiscoverable() }, weighted(dp(46)))
-                  actions.addView(smallButton("다시 연결") { reconnect() }, weighted(dp(46)))
+                  actions.addView(smallButton("PC 선택") { pickPc() }, weighted(dp(46)))
                   root.addView(actions, LinearLayout.LayoutParams(dp(330), wrap).apply { bottomMargin = dp(28) })
 
                   val grid = listOf(
