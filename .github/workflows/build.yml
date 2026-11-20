@@ -51,8 +51,8 @@ jobs:
                   applicationId = "com.example.btremote"
                   minSdk = 28
                   targetSdk = 34
-                  versionCode = 4
-                  versionName = "1.3"
+                  versionCode = 5
+                  versionName = "1.4"
               }
 
               compileOptions {
@@ -73,6 +73,9 @@ jobs:
               <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
               <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
 
               <application
@@ -88,6 +91,10 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <service
+                      android:name=".KeepAliveService"
+                      android:exported="false"
+                      android:foregroundServiceType="connectedDevice" />
               </application>
           </manifest>
           EOF_FILE
@@ -102,7 +109,6 @@ jobs:
           import android.bluetooth.BluetoothAdapter
           import android.bluetooth.BluetoothDevice
           import android.bluetooth.BluetoothHidDevice
-          import android.bluetooth.BluetoothHidDeviceAppQosSettings
           import android.bluetooth.BluetoothHidDeviceAppSdpSettings
           import android.bluetooth.BluetoothManager
           import android.bluetooth.BluetoothProfile
@@ -250,6 +256,7 @@ jobs:
                   handler.removeCallbacksAndMessages(null)
                   try { unregisterReceiver(receiver) } catch (_: Exception) {}
                   try {
+                      stopService(Intent(this, KeepAliveService::class.java))
                       hid?.unregisterApp()
                       hid?.let { adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, it) }
                   } catch (_: Exception) {
@@ -264,7 +271,8 @@ jobs:
                       Manifest.permission.BLUETOOTH_ADVERTISE,
                       Manifest.permission.BLUETOOTH_SCAN
                   ) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
-                  val needed = wanted.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                  val extra = if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.POST_NOTIFICATIONS) else emptyArray()
+                  val needed = (wanted + extra).filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
                   if (needed.isNotEmpty()) {
                       requestPermissions(needed.toTypedArray(), REQ_PERM)
                       return
@@ -275,7 +283,10 @@ jobs:
               override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
                   super.onRequestPermissionsResult(code, perms, results)
                   if (code != REQ_PERM) return
-                  if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) {
+                  val essentialOk = perms.indices.all { i ->
+                      perms[i] == Manifest.permission.POST_NOTIFICATIONS || results.getOrNull(i) == PackageManager.PERMISSION_GRANTED
+                  }
+                  if (results.isNotEmpty() && essentialOk) {
                       ensureEnabled()
                   } else {
                       setStatus("블루투스 권한을 허용해야 쓸 수 있어요")
@@ -302,24 +313,20 @@ jobs:
 
               private fun startHid() {
                   setStatus("준비 중")
+                  try {
+                      val svc = Intent(this, KeepAliveService::class.java)
+                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
+                  } catch (e: Exception) {
+                      setStatus("백그라운드 유지 실패: ${e.javaClass.simpleName}")
+                  }
                   adapter?.getProfileProxy(this, profileListener, BluetoothProfile.HID_DEVICE)
               }
 
               private val profileListener = object : BluetoothProfile.ServiceListener {
                   override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
                       if (profile != BluetoothProfile.HID_DEVICE) return
-                      val h = proxy as BluetoothHidDevice
-                      hid = h
-                      val sdp = BluetoothHidDeviceAppSdpSettings(
-                          "BT Remote", "Keyboard", "BtRemote",
-                          BluetoothHidDevice.SUBCLASS1_KEYBOARD, DESCRIPTOR
-                      )
-                      val qos = BluetoothHidDeviceAppQosSettings(
-                          BluetoothHidDeviceAppQosSettings.SERVICE_BEST_EFFORT,
-                          800, 9, 0, 11250, BluetoothHidDeviceAppQosSettings.MAX
-                      )
-                      val ok = h.registerApp(sdp, null, qos, mainExecutor, hidCallback)
-                      if (!ok) setStatus("키보드 등록 실패: 다른 블루투스 키보드 앱을 강제 중지하고 다시 실행하세요")
+                      hid = proxy as BluetoothHidDevice
+                      register()
                   }
 
                   override fun onServiceDisconnected(profile: Int) {
@@ -329,14 +336,40 @@ jobs:
                   }
               }
 
+              private var isRegistered = false
+              private val regWatch = Runnable {
+                  if (!isRegistered) setStatus("[1단계 실패] 등록 응답 없음: 폰 블루투스를 껐다 켜고 앱을 다시 실행하세요")
+              }
+              private var pendingConnect: BluetoothDevice? = null
+              private var retried = false
+
+              private fun register() {
+                  val h = hid ?: return
+                  val sdp = BluetoothHidDeviceAppSdpSettings(
+                      "BT Remote", "Keyboard", "BtRemote",
+                      BluetoothHidDevice.SUBCLASS1_KEYBOARD, DESCRIPTOR
+                  )
+                  val ok = h.registerApp(sdp, null, null, mainExecutor, hidCallback)
+                  if (!ok) {
+                      setStatus("[1단계 실패] 키보드 등록 거부됨: 폰을 재부팅하고 이 앱만 실행하세요")
+                      return
+                  }
+                  setStatus("[1단계] 키보드 등록 중")
+                  handler.removeCallbacks(regWatch)
+                  handler.postDelayed(regWatch, 6_000)
+              }
+
               private val hidCallback = object : BluetoothHidDevice.Callback() {
                   override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+                      handler.removeCallbacks(regWatch)
+                      isRegistered = registered
                       if (!registered) {
-                          setStatus("키보드 등록이 해제됐어요. 다른 블루투스 키보드 앱을 강제 중지하고 이 앱을 다시 실행하세요")
+                          setStatus("[1단계] 키보드 등록 해제됨. ‘PC 선택’을 누르면 다시 등록해요")
                           return
                       }
                       val bonded = adapter?.bondedDevices.orEmpty()
-                      val target = savedHost() ?: pluggedDevice?.takeIf { d -> bonded.any { it.address == d.address } }
+                      val target = pendingConnect ?: savedHost() ?: pluggedDevice?.takeIf { d -> bonded.any { it.address == d.address } }
+                      pendingConnect = null
                       if (target != null) {
                           connectTo(target)
                       } else {
@@ -384,11 +417,28 @@ jobs:
               private fun connectTo(d: BluetoothDevice) {
                   val h = hid ?: run { setStatus("아직 준비 중이에요. 잠시 후 다시 눌러주세요"); return }
                   prefs.edit().putString("host", d.address).apply()
-                  setStatus("${nameOf(d)}에 연결 중")
-                  if (!h.connect(d)) {
-                      setStatus("연결 요청 실패: 폰 블루투스를 껐다 켜고 앱을 다시 실행하세요")
+                  if (!isRegistered) {
+                      pendingConnect = d
+                      setStatus("[1단계] 키보드 다시 등록하는 중")
+                      register()
                       return
                   }
+                  setStatus("[2단계] ${nameOf(d)}에 연결 중")
+                  if (!h.connect(d)) {
+                      if (!retried) {
+                          retried = true
+                          pendingConnect = d
+                          isRegistered = false
+                          setStatus("[2단계] 연결 거부됨. 키보드 재등록 후 재시도하는 중")
+                          try { h.unregisterApp() } catch (_: Exception) {}
+                          handler.postDelayed({ register() }, 1000)
+                      } else {
+                          retried = false
+                          setStatus("[2단계 실패] 연결 거부됨: PC에서 폰을 장치 제거하고 ‘PC 찾기’로 다시 페어링하세요")
+                      }
+                      return
+                  }
+                  retried = false
                   handler.removeCallbacks(timeout)
                   handler.postDelayed(timeout, 10_000)
               }
