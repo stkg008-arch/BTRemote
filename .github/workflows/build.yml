@@ -51,8 +51,8 @@ jobs:
                   applicationId = "com.example.btremote"
                   minSdk = 28
                   targetSdk = 34
-                  versionCode = 6
-                  versionName = "1.5"
+                  versionCode = 7
+                  versionName = "1.6"
               }
 
               compileOptions {
@@ -311,69 +311,93 @@ jobs:
 
               private fun startHid() {
                   setStatus("준비 중")
+                  adapter?.getProfileProxy(this, profileListener, BluetoothProfile.HID_DEVICE)
+              }
+
+              private fun startKeepAlive() {
                   try {
                       val svc = Intent(this, KeepAliveService::class.java)
                       if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
-                  } catch (e: Exception) {
-                      setStatus("백그라운드 유지 실패: ${e.javaClass.simpleName}")
+                  } catch (_: Exception) {
                   }
-                  adapter?.getProfileProxy(this, profileListener, BluetoothProfile.HID_DEVICE)
               }
 
               private val profileListener = object : BluetoothProfile.ServiceListener {
                   override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
                       if (profile != BluetoothProfile.HID_DEVICE) return
                       hid = proxy as BluetoothHidDevice
-                      register()
+                      startRegistration()
                   }
 
                   override fun onServiceDisconnected(profile: Int) {
                       hid = null
                       host = null
+                      isRegistered = false
                       setStatus("블루투스 서비스가 끊겼어요. 앱을 다시 실행하세요")
                   }
               }
 
               private var isRegistered = false
-              private var regRetried = false
-              private val regWatch = Runnable {
-                  if (isRegistered) return@Runnable
-                  if (!regRetried) {
-                      regRetried = true
-                      setStatus("[1단계] 응답이 없어 다시 등록하는 중")
-                      try { hid?.unregisterApp() } catch (_: Exception) {}
-                      handler.postDelayed({ register() }, 1500)
-                  } else {
-                      setStatus("[1단계 실패] 등록 응답 없음")
-                  }
-              }
+              private var regAttempt = 0
+              private val maxAttempts = 4
               private var pendingConnect: BluetoothDevice? = null
               private var retried = false
 
-              private fun register() {
+              private val regWatch = Runnable {
+                  if (!isRegistered) nextAttempt("응답 없음")
+              }
+
+              private fun startRegistration() {
+                  regAttempt = 0
+                  nextAttempt(null)
+              }
+
+              // 매 시도마다 남아 있을 수 있는 이전 등록을 먼저 풀고 새로 등록
+              private fun nextAttempt(reason: String?) {
                   val h = hid ?: return
+                  handler.removeCallbacks(regWatch)
+                  if (regAttempt >= maxAttempts) {
+                      setStatus("[1단계 실패] 등록 안 됨($reason). 폰 블루투스를 껐다 켠 뒤 앱을 다시 실행하세요")
+                      return
+                  }
+                  regAttempt++
+                  setStatus("[1단계] 키보드 등록 중 ($regAttempt/$maxAttempts)")
+                  try { h.unregisterApp() } catch (_: Exception) {}
+                  handler.postDelayed({ doRegister() }, 800L * regAttempt)
+              }
+
+              private fun doRegister() {
+                  val h = hid ?: return
+                  if (isRegistered) return
                   val sdp = BluetoothHidDeviceAppSdpSettings(
                       "방향키 리모컨", "방향키 리모컨", "BtRemote",
                       BluetoothHidDevice.SUBCLASS1_KEYBOARD, DESCRIPTOR
                   )
-                  val ok = h.registerApp(sdp, null, null, mainExecutor, hidCallback)
+                  val ok = try {
+                      h.registerApp(sdp, null, null, { r -> runOnUiThread(r) }, hidCallback)
+                  } catch (_: Exception) {
+                      false
+                  }
                   if (!ok) {
-                      setStatus("[1단계 실패] 키보드 등록 거부됨: 폰을 재부팅하고 이 앱만 실행하세요")
+                      nextAttempt("거부됨")
                       return
                   }
-                  setStatus("[1단계] 키보드 등록 중")
-                  handler.removeCallbacks(regWatch)
-                  handler.postDelayed(regWatch, 6_000)
+                  handler.postDelayed(regWatch, 5_000)
               }
+
+              private fun register() = startRegistration()
 
               private val hidCallback = object : BluetoothHidDevice.Callback() {
                   override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
-                      handler.removeCallbacks(regWatch)
-                      isRegistered = registered
                       if (!registered) {
-                          setStatus("[1단계] 키보드 등록 해제됨. ‘PC 선택’을 누르면 다시 등록해요")
+                          val was = isRegistered
+                          isRegistered = false
+                          if (was) setStatus("[1단계] 키보드 등록 해제됨. ‘PC 선택’을 누르면 다시 등록해요")
                           return
                       }
+                      handler.removeCallbacks(regWatch)
+                      isRegistered = true
+                      startKeepAlive()
                       val bonded = adapter?.bondedDevices.orEmpty()
                       val target = pendingConnect ?: savedHost() ?: pluggedDevice?.takeIf { d -> bonded.any { it.address == d.address } }
                       pendingConnect = null
